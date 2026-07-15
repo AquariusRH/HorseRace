@@ -1,0 +1,10 @@
+streamlit==1.59.0
+pandas
+numpy
+requests
+matplotlib
+plotly
+python-dateutil
+scikit-learn
+bs4
+statsmodels
