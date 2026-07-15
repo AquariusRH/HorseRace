@@ -1,552 +1,585 @@
-"""
-ui_components.py
-
-PySide6 UI components implementing a Real-time Scraper tab and core interactions.
-Contains a TabWidget with tabs for:
-- Real-time Scraper
-- Rankings (Jockey / Trainer)
-- Processing / Scoring
-- Visualizations (Matplotlib & Plotly embedding)
-- Settings / Export
-
-Defines a ScrapeWorker (QRunnable) that runs scraping in background and emits signals
-for status updates and results.
-"""
-from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit,
-    QTabWidget, QFileDialog, QMessageBox, QComboBox, QSpinBox, QProgressBar, QTableView, QDateEdit
-)
-from PySide6.QtCore import Qt, Slot, QThreadPool, QObject, Signal, QRunnable, QThread
-from PySide6.QtWebEngineWidgets import QWebEngineView
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
-from matplotlib.figure import Figure
-try:
-    import plotly.io as pio
-except Exception:
-    pio = None
-import tempfile
-import os
-import core_logic
+# ui_components.py
+import sys
+import traceback
 import pandas as pd
 import numpy as np
-import time
-from datetime import datetime
+from PySide6 import QtCore, QtWidgets, QtGui
+from PySide6.QtCore import Qt, Slot
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+                               QTabWidget, QTextEdit, QDateEdit, QSpinBox, QComboBox)
+# QWebEngineView is optional; try import and provide fallback.
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    HAS_WEBENGINE = True
+except Exception:
+    QWebEngineView = None
+    HAS_WEBENGINE = False
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex
-class PandasModel(QAbstractTableModel):
-    def __init__(self, df=pd.DataFrame(), parent=None):
-        super().__init__(parent)
-        self._df = df
-        self._highlight = None  # DataFrame or dict for highlighting
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import webbrowser
+from datetime import date, datetime
 
-    def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role != Qt.DisplayRole:
-            return None
-        if orientation == Qt.Horizontal:
+from core_logic import DataEngineWorker  # ensure core_logic.py is in same directory
+
+# -------------------------
+# Helper: safe styler -> html
+# -------------------------
+def styler_to_html(styler):
+    """
+    Convert a pandas Styler to HTML in a pandas-version-safe way.
+    Attempts styler.hide(axis='index') first (pandas 2.0+), falls back to hide_index().
+    """
+    try:
+        if hasattr(styler, "hide"):
             try:
-                return str(self._df.columns[section])
+                styler = styler.hide(axis="index")
             except Exception:
-                return ""
+                # best-effort fallback
+                if hasattr(styler, "hide_index"):
+                    try:
+                        styler = styler.hide_index()
+                    except Exception:
+                        pass
         else:
-            try:
-                return str(self._df.index[section])
-            except Exception:
-                return ""
-
-    def rowCount(self, parent=QModelIndex()):
-        return len(self._df.index)
-
-    def columnCount(self, parent=QModelIndex()):
-        return len(self._df.columns)
-
-    def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid():
-            return None
-        r = index.row(); c = index.column()
-        if role == Qt.DisplayRole:
-            val = self._df.iloc[r, c]
-            return str(val)
-        if role == Qt.BackgroundRole and self._highlight is not None:
-            try:
-                col = self._df.columns[c]
-                # highlight can be dict or DataFrame/Series
-                val = None
-                if isinstance(self._highlight, dict):
-                    val = self._highlight.get(col)
-                else:
-                    # assume Series-like with col as key
-                    if col in self._highlight:
-                        val = self._highlight[col]
-                if val is None:
-                    return None
+            if hasattr(styler, "hide_index"):
                 try:
-                    v = float(val)
-                    if v > 0:
-                        from PySide6.QtGui import QBrush, QColor
-                        return QBrush(QColor(200, 255, 200))
-                    elif v < 0:
-                        from PySide6.QtGui import QBrush, QColor
-                        return QBrush(QColor(255, 200, 200))
+                    styler = styler.hide_index()
                 except Exception:
-                    return None
-            except Exception:
-                return None
-        return None
-
-    def setDataFrame(self, df: pd.DataFrame):
-        self.beginResetModel()
-        self._df = df
-        self.endResetModel()
-
-    def setHighlight(self, highlight):
-        """Highlight can be a dict mapping column -> numeric change, or a Series/DataFrame."""
-        self._highlight = highlight
-        # trigger repaint
-        self.dataChanged.emit(self.index(0,0), self.index(max(0,self.rowCount()-1), max(0,self.columnCount()-1)))
-
-
-class MatplotlibCanvas(FigureCanvas):
-    def __init__(self, parent=None, width=6, height=4, dpi=100):
-        fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = fig.add_subplot(111)
-        super().__init__(fig)
-        self.setParent(parent)
-
-    def display_figure(self, fig):
-        # Replace internal figure with provided fig
-        self.figure = fig
-        self.draw()
-
-
-# Worker signals container
-class WorkerSignals(QObject):
-    status = Signal(str)
-    result = Signal(object)
-    error = Signal(str)
-    finished = Signal()
-
-
-class ScrapeWorker(QRunnable):
-    """Runs core_logic.scrape_realtime in a background thread and emits signals."""
-    def __init__(self, date: str, place: str, race_no: int, methods: list):
-        super().__init__()
-        self.date = date
-        self.place = place
-        self.race_no = race_no
-        self.methods = methods
-        self.signals = WorkerSignals()
-
-    def run(self):
+                    pass
+    except Exception:
+        # If anything goes wrong, ignore and continue to to_html()
+        pass
+    try:
+        return styler.to_html()
+    except Exception:
+        # final fallback: plain HTML representation
         try:
-            def status_cb(msg):
-                self.signals.status.emit(msg)
-            result = core_logic.scrape_realtime(self.date, self.place, self.race_no, self.methods, status_callback=status_cb)
-            self.signals.result.emit(result)
-        except Exception as e:
-            self.signals.error.emit(str(e))
-        finally:
-            self.signals.finished.emit()
+            df = styler.data if hasattr(styler, "data") else None
+            if isinstance(df, pd.DataFrame):
+                return df.to_html()
+        except Exception:
+            pass
+        return "<html><body><pre>Failed to render table</pre></body></html>"
 
+# -------------------------
+# RealTimeTab: the main UI
+# -------------------------
+class RealTimeTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.latest_data = {}
+        self.worker = None
 
-class LiveUpdateWorker(QThread):
-    """Background thread that continuously fetches data and emits updates."""
-    update = Signal(object)
-    status = Signal(str)
-    error = Signal(str)
-
-    def __init__(self, date: str, place: str, race_no: int, methods: list, time_delay: float = 5.0):
-        super().__init__()
-        self.date = date
-        self.place = place
-        self.race_no = race_no
-        self.methods = methods
-        self.time_delay = float(time_delay)
-        self._running = False
-
-    def stop(self):
-        self._running = False
-
-    def run(self):
-        self._running = True
-        self.status.emit('Live update started')
-        try:
-            while self._running:
-                self.status.emit('Fetching odds...')
-                try:
-                    odds = core_logic.get_odds_data(self.date, self.place, self.race_no, self.methods)
-                    self.status.emit('Fetching investments...')
-                    investments = core_logic.get_investment_data(self.date, self.place, self.race_no, self.methods)
-                    now_ts = datetime.utcnow()
-                    core_logic.save_odds_data(now_ts, odds, self.methods)
-                    core_logic.save_investment_data(now_ts, investments, odds, self.methods)
-                    diffs = core_logic.weird_data_calc(investments, odds, self.methods)
-                    result = {'odds': odds, 'investments': investments, 'diffs': diffs}
-                    self.update.emit(result)
-                    self.status.emit('Update emitted')
-                except Exception as e:
-                    self.error.emit(str(e))
-                # sleep but check running flag periodically
-                slept = 0.0
-                interval = 0.2
-                while self._running and slept < self.time_delay:
-                    time.sleep(interval)
-                    slept += interval
-        finally:
-            self.status.emit('Live update stopped')
-
-
-class MainWindow(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle('Jockey Race - Desktop')
-        self.resize(1200, 800)
-        self.threadpool = QThreadPool.globalInstance()
         self._build_ui()
+        self._connect_slots()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
-        tabs = QTabWidget()
-        tabs.addTab(self._make_scraper_tab(), 'Real-time Scraper')
-        tabs.addTab(self._make_rank_tab(), 'Rankings')
-        tabs.addTab(self._make_process_tab(), 'Process & Score')
-        tabs.addTab(self._make_visual_tab(), 'Visualization')
-        tabs.addTab(self._make_settings_tab(), 'Settings')
-        layout.addWidget(tabs)
-        self.setLayout(layout)
+        root = QVBoxLayout(self)
 
-    def _make_scraper_tab(self):
-        w = QWidget()
-        layout = QVBoxLayout()
-
-        control_h = QHBoxLayout()
-        self.date_edit = QDateEdit()
+        # Controls row
+        controls = QHBoxLayout()
+        self.date_edit = QDateEdit(QtCore.QDate.currentDate())
         self.date_edit.setCalendarPopup(True)
-        self.date_edit.setDisplayFormat('yyyy-MM-dd')
-        self.date_edit.setDate(self.date_edit.date())
-        self.place_combo = QComboBox()
-        self.place_combo.addItems(['ST', 'HV', 'ST-HK', 'HV-HK'])
-        self.race_spin = QSpinBox(); self.race_spin.setMinimum(1); self.race_spin.setMaximum(20)
-        self.methods_input = QLineEdit(); self.methods_input.setPlaceholderText('WIN,PLA,QIN')
-        self.scrape_btn = QPushButton('Start Scrape')
-        self.scrape_btn.clicked.connect(self.on_start_scrape)
-        control_h.addWidget(QLabel('Date:'))
-        control_h.addWidget(self.date_edit)
-        control_h.addWidget(QLabel('Place:'))
-        control_h.addWidget(self.place_combo)
-        control_h.addWidget(QLabel('Race No:'))
-        control_h.addWidget(self.race_spin)
-        control_h.addWidget(QLabel('Methods:'))
-        control_h.addWidget(self.methods_input)
-        control_h.addWidget(self.scrape_btn)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        controls.addWidget(QLabel("Race Date:"))
+        controls.addWidget(self.date_edit)
 
-        layout.addLayout(control_h)
+        self.place_box = QComboBox()
+        self.place_box.addItems(["ST", "HV", "HV2", "ST2"])  # example; user can edit
+        controls.addWidget(QLabel("Venue:"))
+        controls.addWidget(self.place_box)
 
-        # Status & progress
-        self.status_log = QTextEdit(); self.status_log.setReadOnly(True); self.status_log.setFixedHeight(150)
-        layout.addWidget(self.status_log)
-        self.progress = QProgressBar(); self.progress.setVisible(False)
-        layout.addWidget(self.progress)
+        self.race_spin = QSpinBox()
+        self.race_spin.setMinimum(1)
+        self.race_spin.setMaximum(20)
+        controls.addWidget(QLabel("Race #:"))
+        controls.addWidget(self.race_spin)
 
-        # Auto-update controls
-        auto_h = QHBoxLayout()
-        self.start_auto_btn = QPushButton('Start Real-Time Auto-Update')
-        self.stop_auto_btn = QPushButton('Stop')
-        self.stop_auto_btn.setEnabled(False)
-        auto_h.addWidget(self.start_auto_btn)
-        auto_h.addWidget(self.stop_auto_btn)
-        layout.addLayout(auto_h)
+        self.method_box = QComboBox()
+        self.method_box.addItems(["WIN", "PLA", "QIN", "QPL"])  # user can change to multiselect in future
+        controls.addWidget(QLabel("Method:"))
+        controls.addWidget(self.method_box)
 
-        # Per-pool tabs for results
-        self.METHODS = ['WIN','PLA','QIN','QPL','FCT','TRI','FF']
-        self.pool_tabs = QTabWidget()
-        self.pool_tables = {}
-        self.pool_models = {}
-        for m in self.METHODS:
-            tbl = QTableView()
-            model = PandasModel(pd.DataFrame())
-            tbl.setModel(model)
-            self.pool_tables[m] = tbl
-            self.pool_models[m] = model
-            self.pool_tabs.addTab(tbl, m)
-        layout.addWidget(self.pool_tabs, stretch=1)
+        self.delay_spin = QSpinBox()
+        self.delay_spin.setMinimum(1)
+        self.delay_spin.setMaximum(600)
+        self.delay_spin.setValue(5)
+        controls.addWidget(QLabel("Delay (s):"))
+        controls.addWidget(self.delay_spin)
 
-        w.setLayout(layout)
+        self.start_btn = QPushButton("Start")
+        self.stop_btn = QPushButton("Stop")
+        self.reset_btn = QPushButton("Reset Data")
+        controls.addWidget(self.start_btn)
+        controls.addWidget(self.stop_btn)
+        controls.addWidget(self.reset_btn)
 
-        # Connect auto buttons
-        self.start_auto_btn.clicked.connect(self.on_start_auto)
-        self.stop_auto_btn.clicked.connect(self.on_stop_auto)
-        return w
+        root.addLayout(controls)
 
-    def _make_rank_tab(self):
-        w = QWidget(); layout = QVBoxLayout()
-        hl = QHBoxLayout()
-        self.jockey_btn = QPushButton('Fetch Jockey Ranking')
-        self.jockey_btn.clicked.connect(self.on_fetch_jockey)
-        self.trainer_btn = QPushButton('Fetch Trainer Ranking')
-        self.trainer_btn.clicked.connect(self.on_fetch_trainer)
-        hl.addWidget(self.jockey_btn); hl.addWidget(self.trainer_btn)
-        layout.addLayout(hl)
-        self.rank_output = QTextEdit(); self.rank_output.setReadOnly(True)
-        layout.addWidget(self.rank_output)
-        w.setLayout(layout)
-        return w
+        # Tabs
+        self.tabs = QTabWidget()
+        # Results tab per pool
+        self.win_tab = QWidget()
+        self.pla_tab = QWidget()
+        self.henery_tab = QWidget()
+        self.charts_tab = QWidget()
+        self.rank_tab = QWidget()
 
-    def _make_process_tab(self):
-        w = QWidget(); layout = QVBoxLayout()
-        self.process_btn = QPushButton('Process & Score Latest Data')
-        self.process_btn.clicked.connect(self.on_process)
-        layout.addWidget(self.process_btn)
-        self.process_output = QTextEdit(); self.process_output.setReadOnly(True)
-        layout.addWidget(self.process_output)
-        w.setLayout(layout)
-        return w
+        self.tabs.addTab(self.win_tab, "WIN")
+        self.tabs.addTab(self.pla_tab, "PLA")
+        self.tabs.addTab(self.henery_tab, "Henery")
+        self.tabs.addTab(self.charts_tab, "Charts")
+        self.tabs.addTab(self.rank_tab, "Rankings")
 
-    def _make_visual_tab(self):
-        w = QWidget(); layout = QVBoxLayout()
-        self.plot_canvas = MatplotlibCanvas(self, width=8, height=5)
-        toolbar = NavigationToolbar(self.plot_canvas, self)
-        layout.addWidget(toolbar)
-        layout.addWidget(self.plot_canvas)
-        # Plotly view
-        self.plotly_view = QWebEngineView()
-        layout.addWidget(self.plotly_view, stretch=1)
-        btn_h = QHBoxLayout()
-        self.plot_bar_btn = QPushButton('Plot Sample Bar')
-        self.plot_bar_btn.clicked.connect(self.on_plot_bar)
-        self.plot_bubble_btn = QPushButton('Plot Sample Bubble (Plotly)')
-        self.plot_bubble_btn.clicked.connect(self.on_plot_bubble)
-        btn_h.addWidget(self.plot_bar_btn); btn_h.addWidget(self.plot_bubble_btn)
-        layout.addLayout(btn_h)
-        w.setLayout(layout)
-        return w
+        root.addWidget(self.tabs, stretch=1)
 
-    def _make_settings_tab(self):
-        w = QWidget(); layout = QVBoxLayout()
-        self.export_btn = QPushButton('Export Latest Results')
-        self.export_btn.clicked.connect(self.on_export)
-        layout.addWidget(self.export_btn)
-        w.setLayout(layout)
-        return w
+        # Logging area
+        log_layout = QVBoxLayout()
+        log_layout.addWidget(QLabel("Log:"))
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        log_layout.addWidget(self.log)
+        root.addLayout(log_layout)
 
-    # ---------------- Slots / Callbacks ----------------
+        # Build inner tab contents
+        self._build_win_tab()
+        self._build_pla_tab()
+        self._build_henery_tab()
+        self._build_charts_tab()
+        self._build_rank_tab()
+
+        self.setLayout(root)
+
+    def _build_win_tab(self):
+        layout = QVBoxLayout()
+        self.win_web = QWebEngineView() if HAS_WEBENGINE else None
+        if self.win_web:
+            layout.addWidget(self.win_web)
+        else:
+            self.win_fallback = QTextEdit()
+            self.win_fallback.setReadOnly(True)
+            layout.addWidget(self.win_fallback)
+        self.win_tab.setLayout(layout)
+
+    def _build_pla_tab(self):
+        layout = QVBoxLayout()
+        self.pla_web = QWebEngineView() if HAS_WEBENGINE else None
+        if self.pla_web:
+            layout.addWidget(self.pla_web)
+        else:
+            self.pla_fallback = QTextEdit()
+            self.pla_fallback.setReadOnly(True)
+            layout.addWidget(self.pla_fallback)
+        self.pla_tab.setLayout(layout)
+
+    def _build_henery_tab(self):
+        layout = QVBoxLayout()
+        self.henery_web = QWebEngineView() if HAS_WEBENGINE else None
+        if self.henery_web:
+            layout.addWidget(self.henery_web)
+        else:
+            self.henery_fallback = QTextEdit()
+            self.henery_fallback.setReadOnly(True)
+            layout.addWidget(self.henery_fallback)
+        self.henery_tab.setLayout(layout)
+
+    def _build_charts_tab(self):
+        layout = QVBoxLayout()
+        # Matplotlib canvas
+        self.fig, self.ax = plt.subplots(figsize=(8, 4))
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(self.canvas)
+
+        # Plotly webviews
+        self.plotly_bubble = QWebEngineView() if HAS_WEBENGINE else None
+        self.plotly_advanced = QWebEngineView() if HAS_WEBENGINE else None
+        if self.plotly_bubble:
+            layout.addWidget(self.plotly_bubble, stretch=1)
+        else:
+            self.plotly_bubble_fallback = QTextEdit()
+            self.plotly_bubble_fallback.setReadOnly(True)
+            layout.addWidget(self.plotly_bubble_fallback)
+
+        if self.plotly_advanced:
+            layout.addWidget(self.plotly_advanced, stretch=1)
+        else:
+            self.plotly_advanced_fallback = QTextEdit()
+            self.plotly_advanced_fallback.setReadOnly(True)
+            layout.addWidget(self.plotly_advanced_fallback)
+        self.charts_tab.setLayout(layout)
+
+    def _build_rank_tab(self):
+        layout = QVBoxLayout()
+        self.rank_web = QWebEngineView() if HAS_WEBENGINE else None
+        if self.rank_web:
+            layout.addWidget(self.rank_web)
+        else:
+            self.rank_fallback = QTextEdit()
+            self.rank_fallback.setReadOnly(True)
+            layout.addWidget(self.rank_fallback)
+        self.rank_tab.setLayout(layout)
+
+    def _connect_slots(self):
+        self.start_btn.clicked.connect(self.start_worker)
+        self.stop_btn.clicked.connect(self.stop_worker)
+        self.reset_btn.clicked.connect(self._on_reset_clicked)
+
     @Slot()
-    def on_start_scrape(self):
-        date = self.date_edit.date().toString('yyyy-MM-dd')
-        place = self.place_combo.currentText()
-        race_no = int(self.race_spin.value())
-        methods = [m.strip() for m in (self.methods_input.text() or 'WIN,PLA').split(',') if m.strip()]
-        if not date:
-            QMessageBox.warning(self, 'Input required', 'Please input a date (YYYY-MM-DD)')
+    def start_worker(self):
+        if self.worker and self.worker.isRunning():
+            self._append_log("Worker already running.")
             return
-        self.status_log.clear()
-        self.append_status('Scheduling single scrape...')
-        self.scrape_btn.setEnabled(False)
-        self.progress.setVisible(True)
-        self.progress.setRange(0,0)  # Indeterminate
+        race_date = self.date_edit.date().toString("yyyy-MM-dd")
+        place = self.place_box.currentText()
+        race_no = self.race_spin.value()
+        method = self.method_box.currentText()
+        methods = [method]  # as list (parity with streamlit methodlist)
+        delay = self.delay_spin.value()
 
-        worker = ScrapeWorker(date, place, race_no, methods)
-        worker.signals.status.connect(self.append_status)
-        worker.signals.result.connect(self.on_scrape_result)
-        worker.signals.error.connect(self.on_scrape_error)
-        worker.signals.finished.connect(self.on_scrape_finished)
-        self.threadpool.start(worker)
+        self._append_log(f"Starting worker: {race_date} R{race_no} @ {place}, methods={methods}, delay={delay}s")
 
-    @Slot(str)
-    def append_status(self, msg: str):
-        from datetime import datetime as _dt
-        timestamp = _dt.now().strftime('%H:%M:%S')
-        self.status_log.append(f"[{timestamp}] {msg}")
+        # Create and start worker
+        self.worker = DataEngineWorker(race_date, place, race_no, methods, time_delay=delay)
+        self.worker.data_ready_signal.connect(self.handle_new_data)
+        self.worker.log_signal.connect(self._append_log)
+        # ensure stop handler exists
+        self.worker.stopped_signal.connect(self._on_worker_stopped)
 
-    @Slot(object)
-    def on_scrape_result(self, result):
-        # result is dict with keys: odds, investments, age, display_df
-        self.append_status('Scrape result received. Updating UI...')
-        odds = result.get('odds', {})
-        investments = result.get('investments', {})
-        # Update each pool tab separately
-        for m in self.METHODS:
+        self.worker.start()
+
+    @Slot()
+    def stop_worker(self):
+        if self.worker:
+            self._append_log("Stopping worker...")
+            self.worker.stop()
+        else:
+            self._append_log("No active worker to stop.")
+
+    @Slot()
+    def _on_worker_stopped(self):
+        self._append_log("Worker has stopped.")
+        # Keep UI state; do not clear display unless reset clicked.
+
+    @Slot()
+    def _on_reset_clicked(self):
+        self._append_log("Reset button clicked: clearing worker and UI state.")
+        # Reset core worker state
+        if self.worker:
             try:
-                if m in ['WIN','PLA']:
-                    vals = odds.get(m, [])
-                    inv = core_logic.core_state.investment_dict.get(m, pd.DataFrame())
-                    if vals:
-                        cols = [str(i+1) for i in range(len(vals))]
-                        odds_row = [float(x) if x != np.inf else np.nan for x in vals]
-                        # get latest investment row from core_state if exists
-                        invest_row = None
-                        if not inv.empty:
-                            invest_row = inv.iloc[-1].tolist()
-                        else:
-                            # compute per-horse using pool if available
-                            pool = investments.get(m, [None])[0] if investments.get(m) else None
-                            if pool is not None:
-                                invest_row = [round(pool / 1000 / float(o) if o not in (0, np.inf, None) else 0, 2) for o in vals]
-                        df = pd.DataFrame([odds_row, invest_row], index=['Odds','Investment'], columns=cols)
-                        model = self.pool_models[m]
-                        model.setDataFrame(df)
-                        # set diff highlighting if available
-                        diff_df = core_logic.core_state.diff_dict.get(m, pd.DataFrame())
-                        if not diff_df.empty:
-                            last_diff = diff_df.iloc[-1]
-                            # map column labels to values
-                            highlight = {str(col): last_diff[col] for col in last_diff.index}
-                            model.setHighlight(highlight)
-                        else:
-                            model.setHighlight(None)
-                else:
-                    vals = odds.get(m, [])
-                    inv_df = core_logic.core_state.investment_dict.get(m, pd.DataFrame())
-                    if vals:
-                        combs = [c for c,_ in vals]
-                        odds_vals = [v for _,v in vals]
-                        inv_row = None
-                        if not inv_df.empty:
-                            inv_row = inv_df.iloc[-1].tolist()
-                        else:
-                            pool = investments.get(m, [None])[0] if investments.get(m) else None
-                            if pool is not None:
-                                inv_row = [round(pool / 1000 / float(o) if o not in (0, np.inf, None) else 0, 2) for o in odds_vals]
-                        df = pd.DataFrame([odds_vals, inv_row], index=['Odds','Investment'], columns=combs)
-                        model = self.pool_models[m]
-                        model.setDataFrame(df)
-                        diff_df = core_logic.core_state.diff_dict.get(m, pd.DataFrame())
-                        if not diff_df.empty:
-                            last_diff = diff_df.iloc[-1]
-                            highlight = {col: last_diff[col] for col in last_diff.index}
-                            model.setHighlight(highlight)
-                        else:
-                            model.setHighlight(None)
+                self.worker.reset_state()
             except Exception as e:
-                self.append_status(f'Error updating table for {m}: {e}')
-        # update age tab or show message
-        age_df = result.get('age')
-        if age_df is not None:
-            # place in a dedicated tab named 'AGE' if exists
-            if 'AGE' not in self.pool_models:
-                tbl = QTableView(); model = PandasModel(age_df.reset_index())
-                self.pool_tabs.addTab(tbl, 'AGE')
-                self.pool_tables['AGE'] = tbl
-                self.pool_models['AGE'] = model
-                tbl.setModel(model)
+                self._append_log(f"Reset worker state error: {e}")
+        # Clear latest_data and displays
+        self.latest_data = {}
+        # Clear web views / fallbacks
+        try:
+            if HAS_WEBENGINE:
+                for w in (self.win_web, self.pla_web, self.henery_web, self.plotly_bubble, self.plotly_advanced, self.rank_web):
+                    if w:
+                        w.setHtml("<html><body></body></html>")
             else:
-                self.pool_models['AGE'].setDataFrame(age_df.reset_index())
-        self.append_status('UI updated')
+                for t in (getattr(self, 'win_fallback', None), getattr(self, 'pla_fallback', None),
+                          getattr(self, 'henery_fallback', None), getattr(self, 'plotly_bubble_fallback', None),
+                          getattr(self, 'plotly_advanced_fallback', None), getattr(self, 'rank_fallback', None)):
+                    if t:
+                        t.clear()
+            # Clear matplotlib
+            self.ax.clear()
+            self.canvas.draw()
+        except Exception as e:
+            self._append_log(f"UI clear error: {e}")
 
     @Slot(str)
-    def on_scrape_error(self, err):
-        self.append_status('Error: ' + err)
-
-    @Slot()
-    def on_scrape_finished(self):
-        self.append_status('Scrape finished')
-        self.scrape_btn.setEnabled(True)
-        self.progress.setVisible(False)
-
-    @Slot()
-    def on_start_auto(self):
-        # start live update thread
-        date = self.date_edit.date().toString('yyyy-MM-dd')
-        place = self.place_combo.currentText()
-        race_no = int(self.race_spin.value())
-        methods = [m.strip() for m in (self.methods_input.text() or 'WIN,PLA').split(',') if m.strip()]
-        # time_delay: use a default of 5 seconds or allow user to change later
-        time_delay = 5.0
-        self.live_thread = LiveUpdateWorker(date, place, race_no, methods, time_delay=time_delay)
-        self.live_thread.update.connect(self.on_live_update)
-        self.live_thread.status.connect(self.append_status)
-        self.live_thread.error.connect(lambda e: self.append_status('Live error: ' + str(e)))
-        self.live_thread.start()
-        self.start_auto_btn.setEnabled(False)
-        self.stop_auto_btn.setEnabled(True)
-        self.append_status('Auto-update started')
-
-    @Slot()
-    def on_stop_auto(self):
-        if hasattr(self, 'live_thread') and self.live_thread is not None:
-            self.live_thread.stop()
-            self.live_thread.wait(1000)
-            self.append_status('Auto-update stopping')
-        self.start_auto_btn.setEnabled(True)
-        self.stop_auto_btn.setEnabled(False)
-
-    @Slot(object)
-    def on_live_update(self, result):
-        self.append_status('Live update received')
-        # reuse single-run result handling to update per-pool tabs
+    def _append_log(self, text):
+        # QTextEdit.append is available and appends with newline
         try:
-            self.on_scrape_result(result)
+            self.log.append(text)
+        except Exception:
+            try:
+                self.log.insertPlainText(text + "\n")
+            except Exception:
+                print(text)
+
+    @Slot(dict)
+    def handle_new_data(self, data):
+        """
+        Main-thread-only rendering of tables and charts.
+        Expects data keys like 'WIN_odds', 'WIN_investment', 'henery', 'jockey_rank', 'trainer_rank', 'timestamp'
+        Must use explicit None checks for DataFrames to avoid pandas truth-value ambiguity.
+        """
+        try:
+            self.latest_data = data.copy()
+
+            timestamp = data.get("timestamp", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+            self._append_log(f"handle_new_data: received at {timestamp}")
+
+            # Safe retrieval with explicit None checks
+            win_odds_raw = data.get("WIN_odds")
+            win_odds = win_odds_raw if win_odds_raw is not None else pd.DataFrame()
+
+            win_invest_raw = data.get("WIN_investment")
+            win_invest = win_invest_raw if win_invest_raw is not None else pd.DataFrame()
+
+            pla_odds_raw = data.get("PLA_odds")
+            pla_odds = pla_odds_raw if pla_odds_raw is not None else pd.DataFrame()
+
+            pla_invest_raw = data.get("PLA_investment")
+            pla_invest = pla_invest_raw if pla_invest_raw is not None else pd.DataFrame()
+
+            henery_df_raw = data.get("henery")
+            henery_df = henery_df_raw if henery_df_raw is not None else pd.DataFrame()
+
+            jockey_raw = data.get("jockey_rank")
+            jockey_rank = jockey_raw if jockey_raw is not None else pd.DataFrame()
+
+            trainer_raw = data.get("trainer_rank")
+            trainer_rank = trainer_raw if trainer_raw is not None else pd.DataFrame()
+
+            # -----------------------
+            # Render WIN table (styled HTML)
+            # -----------------------
+            if not win_invest.empty:
+                latest_inv = win_invest.tail(1)
+                latest_odds = win_odds.tail(1) if not win_odds.empty else pd.DataFrame()
+                # align index/columns
+                try:
+                    display_df = pd.DataFrame({
+                        "odds": latest_odds.iloc[0].values if not latest_odds.empty else [np.nan]*len(latest_inv.columns),
+                        "investment": latest_inv.iloc[0].values
+                    }, index=latest_inv.columns)
+                    display_df.index.name = "Horse"
+                    # Add rank-change badge column based on diff if available (diff exists in payload as WIN_diff)
+                    win_diff_raw = data.get("WIN_diff")
+                    win_diff = win_diff_raw if win_diff_raw is not None else pd.DataFrame()
+                    if not win_diff.empty:
+                        last_diff = win_diff.tail(1).iloc[0]
+                        # Create arrow badges
+                        def arrow_badge(v):
+                            try:
+                                v = float(v)
+                                if v > 0:
+                                    return '<span style="color:green">▲{}</span>'.format(int(v))
+                                elif v < 0:
+                                    return '<span style="color:red">▼{}</span>'.format(abs(int(v)))
+                                else:
+                                    return '-'
+                            except Exception:
+                                return '-'
+                        display_df['change'] = [arrow_badge(last_diff.get(col, 0)) for col in display_df.index]
+                    # style
+                    sty = display_df.style.format({"odds": "{:.2f}", "investment": "{:.2f}"}).set_table_attributes('border="0" class="dataframe table table-striped"')
+                    html = styler_to_html(sty)
+                except Exception as e:
+                    self._append_log(f"WIN table formatting error: {e}")
+                    html = "<pre>WIN table render error</pre>"
+            else:
+                html = "<html><body><i>No WIN investment data yet.</i></body></html>"
+
+            if HAS_WEBENGINE and getattr(self, "win_web", None):
+                try:
+                    self.win_web.setHtml(html)
+                except Exception as e:
+                    self._append_log(f"WIN webengine setHtml error: {e}")
+                    if getattr(self, "win_fallback", None):
+                        self.win_fallback.setPlainText(html)
+            else:
+                if getattr(self, "win_fallback", None):
+                    self.win_fallback.setPlainText(html)
+
+            # -----------------------
+            # Render PLA table
+            # -----------------------
+            if not pla_invest.empty:
+                latest_inv = pla_invest.tail(1)
+                latest_odds = pla_odds.tail(1) if not pla_odds.empty else pd.DataFrame()
+                try:
+                    display_df = pd.DataFrame({
+                        "odds": latest_odds.iloc[0].values if not latest_odds.empty else [np.nan]*len(latest_inv.columns),
+                        "investment": latest_inv.iloc[0].values
+                    }, index=latest_inv.columns)
+                    display_df.index.name = "Horse"
+                    # diff badges
+                    pla_diff_raw = data.get("PLA_diff")
+                    pla_diff = pla_diff_raw if pla_diff_raw is not None else pd.DataFrame()
+                    if not pla_diff.empty:
+                        last_diff = pla_diff.tail(1).iloc[0]
+                        def arrow_badge(v):
+                            try:
+                                v = float(v)
+                                if v > 0:
+                                    return '<span style="color:green">▲{}</span>'.format(int(v))
+                                elif v < 0:
+                                    return '<span style="color:red">▼{}</span>'.format(abs(int(v)))
+                                else:
+                                    return '-'
+                            except Exception:
+                                return '-'
+                        display_df['change'] = [arrow_badge(last_diff.get(col, 0)) for col in display_df.index]
+                    sty = display_df.style.format({"odds": "{:.2f}", "investment": "{:.2f}"}).set_table_attributes('border="0" class="dataframe table table-striped"')
+                    html_pla = styler_to_html(sty)
+                except Exception as e:
+                    self._append_log(f"PLA table formatting error: {e}")
+                    html_pla = "<pre>PLA table render error</pre>"
+            else:
+                html_pla = "<html><body><i>No PLA investment data yet.</i></body></html>"
+
+            if HAS_WEBENGINE and getattr(self, "pla_web", None):
+                try:
+                    self.pla_web.setHtml(html_pla)
+                except Exception as e:
+                    self._append_log(f"PLA webengine setHtml error: {e}")
+                    if getattr(self, "pla_fallback", None):
+                        self.pla_fallback.setPlainText(html_pla)
+            else:
+                if getattr(self, "pla_fallback", None):
+                    self.pla_fallback.setPlainText(html_pla)
+
+            # -----------------------
+            # Render Henery table
+            # -----------------------
+            try:
+                if isinstance(henery_df, pd.DataFrame) and not henery_df.empty:
+                    sty = henery_df.style.format({
+                        "odds": "{:.2f}",
+                        "implied_prob": "{:.2f}%",
+                        "theoretical_prob": "{:.2f}%",
+                        "value_index": "{:.3f}",
+                        "expected_edge_pct": "{:.2f}%",
+                        "suggested_fraction": "{:.4f}"
+                    }).set_table_attributes('class="dataframe table table-striped"')
+                    html_h = styler_to_html(sty)
+                else:
+                    html_h = "<html><body><i>No Henery predictions yet.</i></body></html>"
+            except Exception as e:
+                self._append_log(f"Henery formatting error: {e}")
+                html_h = "<pre>Henery render error</pre>"
+
+            if HAS_WEBENGINE and getattr(self, "henery_web", None):
+                try:
+                    self.henery_web.setHtml(html_h)
+                except Exception as e:
+                    self._append_log(f"Henery webengine setHtml error: {e}")
+                    if getattr(self, "henery_fallback", None):
+                        self.henery_fallback.setPlainText(html_h)
+            else:
+                if getattr(self, "henery_fallback", None):
+                    self.henery_fallback.setPlainText(html_h)
+
+            # -----------------------
+            # Render Rankings table
+            # -----------------------
+            try:
+                if not jockey_rank.empty:
+                    sty = jockey_rank.head(50).style.set_table_attributes('class="dataframe table table-sm"')
+                    html_r = styler_to_html(sty)
+                elif not trainer_rank.empty:
+                    sty = trainer_rank.head(50).style.set_table_attributes('class="dataframe table table-sm"')
+                    html_r = styler_to_html(sty)
+                else:
+                    html_r = "<html><body><i>No ranking data yet.</i></body></html>"
+            except Exception as e:
+                self._append_log(f"Rankings formatting error: {e}")
+                html_r = "<pre>Rankings render error</pre>"
+
+            if HAS_WEBENGINE and getattr(self, "rank_web", None):
+                try:
+                    self.rank_web.setHtml(html_r)
+                except Exception as e:
+                    self._append_log(f"Rank webengine setHtml error: {e}")
+                    if getattr(self, "rank_fallback", None):
+                        self.rank_fallback.setPlainText(html_r)
+            else:
+                if getattr(self, "rank_fallback", None):
+                    self.rank_fallback.setPlainText(html_r)
+
+            # -----------------------
+            # Matplotlib real-time chart (print_bar_chart-like)
+            # -----------------------
+            try:
+                self.ax.clear()
+                # Use overall_investment time series if present
+                overall_df = data.get("overall_investment")
+                if isinstance(overall_df, pd.DataFrame) and not overall_df.empty:
+                    # plot last 5 timestamps stacked bars per horse
+                    df = overall_df.tail(5).copy()
+                    df.index = pd.to_datetime(df.index)
+                    df.plot(kind='bar', ax=self.ax)
+                    self.ax.set_title(f"Overall investment (last {len(df)} samples) - {timestamp}")
+                    self.ax.set_xlabel("Timestamp")
+                    self.ax.set_ylabel("Investment")
+                else:
+                    self.ax.text(0.5, 0.5, "No overall investment history yet", ha='center')
+                self.canvas.draw()
+            except Exception as e:
+                self._append_log(f"Matplotlib draw error: {e}\n{traceback.format_exc()}")
+
+            # -----------------------
+            # Plotly bubble & advanced bar charts
+            # -----------------------
+            try:
+                # Bubble: use latest investments vs odds
+                if not win_invest.empty and not win_odds.empty:
+                    latest_inv = win_invest.tail(1).iloc[0]
+                    latest_od = win_odds.tail(1).iloc[0]
+                    horses = list(latest_inv.index.astype(str))
+                    x = latest_od.values
+                    y = latest_inv.values
+                    sizes = np.clip(np.array(y, dtype=float), 1, None) * 3
+                    fig = go.Figure(data=[go.Scatter(
+                        x=x, y=y, text=horses, mode='markers', marker=dict(size=sizes, color=x, colorscale='Viridis', showscale=True)
+                    )])
+                    fig.update_layout(title="Bubble: Odds vs Investment", xaxis_title="Odds", yaxis_title="Investment")
+                    html_bubble = fig.to_html(include_plotlyjs='cdn', full_html=False)
+                else:
+                    html_bubble = "<html><body><i>No bubble data yet.</i></body></html>"
+            except Exception as e:
+                self._append_log(f"Plotly bubble build error: {e}")
+                html_bubble = "<html><body><i>Bubble build error</i></body></html>"
+
+            if HAS_WEBENGINE and getattr(self, "plotly_bubble", None):
+                try:
+                    self.plotly_bubble.setHtml(html_bubble)
+                except Exception as e:
+                    self._append_log(f"plotly_bubble setHtml error: {e}")
+                    if getattr(self, "plotly_bubble_fallback", None):
+                        self.plotly_bubble_fallback.setPlainText(html_bubble)
+            else:
+                if getattr(self, "plotly_bubble_fallback", None):
+                    self.plotly_bubble_fallback.setPlainText(html_bubble)
+
+            # Advanced bar: value_index from henery_df
+            try:
+                if isinstance(henery_df, pd.DataFrame) and not henery_df.empty:
+                    fig2 = go.Figure()
+                    fig2.add_trace(go.Bar(x=henery_df.index.astype(str), y=henery_df['value_index'], name='Value Index'))
+                    fig2.update_layout(title="Henery Value Index", xaxis_title="Horse", yaxis_title="Value Index")
+                    html_adv = fig2.to_html(include_plotlyjs='cdn', full_html=False)
+                else:
+                    html_adv = "<html><body><i>No advanced data yet.</i></body></html>"
+            except Exception as e:
+                self._append_log(f"Plotly advanced build error: {e}")
+                html_adv = "<html><body><i>Advanced build error</i></body></html>"
+
+            if HAS_WEBENGINE and getattr(self, "plotly_advanced", None):
+                try:
+                    self.plotly_advanced.setHtml(html_adv)
+                except Exception as e:
+                    self._append_log(f"plotly_advanced setHtml error: {e}")
+                    if getattr(self, "plotly_advanced_fallback", None):
+                        self.plotly_advanced_fallback.setPlainText(html_adv)
+            else:
+                if getattr(self, "plotly_advanced_fallback", None):
+                    self.plotly_advanced_fallback.setPlainText(html_adv)
+
         except Exception as e:
-            self.append_status('Error applying live update: ' + str(e))
-    @Slot()
-    def on_fetch_jockey(self):
-        self.rank_output.append('Fetching jockey ranking...')
-        df, err = core_logic.fetch_hkjc_jockey_ranking()
-        if err:
-            self.rank_output.append('Error: ' + err)
-            return
-        core_logic.core_state.jockey_ranking_df = df
-        self.rank_output.append(df.to_string(index=False))
+            self._append_log(f"handle_new_data unexpected error: {e}\n{traceback.format_exc()}")
 
-    @Slot()
-    def on_fetch_trainer(self):
-        self.rank_output.append('Fetching trainer ranking...')
-        df, err = core_logic.fetch_hkjc_trainer_ranking()
-        if err:
-            self.rank_output.append('Error: ' + err)
-            return
-        core_logic.core_state.trainer_ranking_df = df
-        self.rank_output.append(df.to_string(index=False))
-
-    @Slot()
-    def on_process(self):
-        self.process_output.append('Running process & score (placeholder)...')
-        try:
-            res = {'summary': 'Example processed result. Replace with your logic.'}
-            core_logic.core_state.latest_results = res
-            self.process_output.append(str(res))
-        except Exception as e:
-            self.process_output.append('Error: ' + str(e))
-
-    @Slot()
-    def on_plot_bar(self):
-        st = core_logic.core_state
-        if st.latest_results and isinstance(st.latest_results, dict) and 'investments' in st.latest_results:
-            investments = st.latest_results['investments']
-            if investments.get('WIN'):
-                arr = investments['WIN']
-                df = pd.DataFrame([arr], columns=[str(i+1) for i in range(len(arr))])
-                fig = core_logic.make_bar_figure(df, title='WIN sample')
-                self.plot_canvas.display_figure(fig)
-                return
-        fig = core_logic.make_bar_figure(pd.DataFrame([[1,2,3]], columns=['1','2','3']), title='Sample')
-        self.plot_canvas.display_figure(fig)
-
-    @Slot()
-    def on_plot_bubble(self):
-        total = pd.DataFrame([[100,200,300]], columns=[1,2,3])
-        deltaI = pd.Series([10,5,20])
-        deltaQ = pd.Series([5,2,10])
-        fig = core_logic.make_bubble_figure(total, deltaI, deltaQ, race_no=1, method_name=['WIN','QIN'])
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.html')
-        try:
-            pio.write_html(fig, tmp.name, full_html=True)
-            self.plotly_view.load('file://' + tmp.name)
-        finally:
-            tmp.close()
-
-    @Slot()
-    def on_export(self):
-        path, _ = QFileDialog.getSaveFileName(self, 'Export latest results', 'results.txt', 'All Files (*)')
-        if not path:
-            return
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(str(core_logic.core_state.latest_results))
-            QMessageBox.information(self, 'Saved', f'Results saved to {path}')
-        except Exception as e:
-            QMessageBox.critical(self, 'Error', str(e))
-
-
-if __name__ == '__main__':
-    print('ui_components module loaded')
+# Optionally provide a main for quick local testing
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    w = RealTimeTab()
+    w.resize(1200, 800)
+    w.show()
+    sys.exit(app.exec())
