@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit,
     QTabWidget, QFileDialog, QMessageBox, QComboBox, QSpinBox, QProgressBar, QTableView, QDateEdit
 )
-from PySide6.QtCore import Qt, Slot, QThreadPool, QObject, Signal, QRunnable, QThread
+from PySide6.QtCore import Qt, Slot, QThreadPool, QObject, Signal, QRunnable, QThread, QDate
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
@@ -223,7 +223,8 @@ class MainWindow(QWidget):
         self.date_edit = QDateEdit()
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setDisplayFormat('yyyy-MM-dd')
-        self.date_edit.setDate(self.date_edit.date())
+        # default to today
+        self.date_edit.setDate(QDate.currentDate())
         self.place_combo = QComboBox()
         self.place_combo.addItems(['ST', 'HV', 'ST-HK', 'HV-HK'])
         self.race_spin = QSpinBox(); self.race_spin.setMinimum(1); self.race_spin.setMaximum(20)
